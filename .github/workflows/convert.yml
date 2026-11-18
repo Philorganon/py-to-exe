@@ -8,43 +8,102 @@ on:
 
 jobs:
   convert:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     permissions:
       contents: write
-    
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Setup conversion environment
         run: |
-          # Install required tools
-          # Example: pip install pyinstaller
-          echo "Setting up environment..."
-          
+          python -m pip install --upgrade pip pyinstaller requests urllib3 colorama
+
       - name: Find uploaded file
         id: find-file
         run: |
-          FILE=$(ls -t uploaded-files/* | head -1)
+          FILE=$(python -c "import pathlib; d = pathlib.Path('uploaded-files'); files = [p for p in d.iterdir() if p.is_file() and p.name != '.gitkeep'] if d.exists() else []; files.sort(key=lambda p: p.stat().st_mtime, reverse=True); print(files[0].as_posix() if files else '')")
           if [ -z "$FILE" ]; then
             echo "No file found"
             exit 0
           fi
-          echo "file=$FILE" >> $GITHUB_OUTPUT
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
           echo "Found file: $FILE"
-      
+
       - name: Convert file
         if: steps.find-file.outputs.file != ''
+        env:
+          TARGET_FILE: ${{ steps.find-file.outputs.file }}
         run: |
-          # Your conversion command
-          # Example: pyinstaller --onefile ${{ steps.find-file.outputs.file }}
-          echo "Converting ${{ steps.find-file.outputs.file }}..."
-          
-          # Simulate conversion
-          mkdir -p dist
-          cp ${{ steps.find-file.outputs.file }} dist/converted-file.txt
+          echo "Converting $TARGET_FILE..."
+          mkdir -p dist build
+
+          if [[ "$TARGET_FILE" == *.py ]]; then
+            python - <<'EOF'
+          import ast
+          import importlib.util
+          import os
+          import subprocess
+          import sys
+
+          target_file = os.environ["TARGET_FILE"]
+          with open(target_file, "r", encoding="utf-8", errors="ignore") as f:
+              source = f.read()
+
+          tree = ast.parse(source, filename=target_file)
+          modules = set()
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  for alias in node.names:
+                      modules.add(alias.name.split(".")[0])
+              elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                  modules.add(node.module.split(".")[0])
+
+          stdlib = getattr(sys, "stdlib_module_names", set())
+          package_map = {
+              "PIL": "Pillow",
+              "cv2": "opencv-python",
+              "bs4": "beautifulsoup4",
+              "yaml": "PyYAML",
+              "Crypto": "pycryptodome",
+              "sklearn": "scikit-learn",
+              "dotenv": "python-dotenv",
+              "win32api": "pywin32",
+              "win32com": "pywin32",
+              "win32con": "pywin32",
+              "win32gui": "pywin32",
+          }
+
+          for mod in sorted(modules):
+              if mod in stdlib or importlib.util.find_spec(mod) is not None:
+                  continue
+              pkg = package_map.get(mod, mod)
+              print(f"Installing detected dependency: {pkg}")
+              subprocess.run([sys.executable, "-m", "pip", "install", pkg], check=False)
+          EOF
+
+            python -m PyInstaller --onefile --clean --distpath dist --workpath build --specpath build "$TARGET_FILE"
+
+            if ! ls dist/*.exe >/dev/null 2>&1; then
+              echo "Error: PyInstaller did not generate a .exe file in dist/"
+              exit 1
+            fi
+            ls -lh dist/
+          else
+            cp "$TARGET_FILE" dist/
+          fi
+
           echo "Conversion complete."
-      
+
       - name: Upload artifact
         if: steps.find-file.outputs.file != ''
         uses: actions/upload-artifact@v4
@@ -52,13 +111,17 @@ jobs:
           name: converted-file
           path: dist/*
           retention-days: 1
-      
+
       - name: Cleanup uploaded file
         if: steps.find-file.outputs.file != ''
+        env:
+          TARGET_FILE: ${{ steps.find-file.outputs.file }}
         run: |
-          rm ${{ steps.find-file.outputs.file }}
+          rm -f "$TARGET_FILE"
+          touch uploaded-files/.gitkeep
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add uploaded-files/
-          git commit -m "Auto-cleanup: Remove processed file"
-          git push
+          git diff --cached --quiet || git commit -m "Auto-cleanup: Remove processed file [skip ci]"
+          git pull --rebase origin main || true
+          git push || true
